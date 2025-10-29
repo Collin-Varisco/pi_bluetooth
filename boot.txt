@@ -1,0 +1,21 @@
+sudo tee /etc/systemd/system/bt-speaker.service >/dev/null <<'EOF'
+[Unit]
+Description=Bluetooth A2DP Sink Pair/Trust Agent
+After=bluetooth.service network.target sound.target
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 /home/crisco/bt_speaker.py
+User=crisco
+Group=crisco
+Restart=on-failure
+RestartSec=2
+
+# Give it D-Bus system access
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
