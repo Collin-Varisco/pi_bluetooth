@@ -1,74 +1,102 @@
 #!/usr/bin/env python3
+# Debian 13 (Trixie) / BlueZ / dbus-next
+# Makes the Pi pairable as an A2DP sink and auto-trusts devices on connect.
+
 import asyncio
+import sys
 from dbus_next.aio import MessageBus
 from dbus_next import BusType, Variant, Message
-from dbus_next.constants import PropertyAccess
-from dbus_next.service import (ServiceInterface, method, dbus_property)
+from dbus_next.service import ServiceInterface, method
 
 BLUEZ = "org.bluez"
+OBJMGR_IFACE = "org.freedesktop.DBus.ObjectManager"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
 ADAPTER_IFACE = "org.bluez.Adapter1"
 DEVICE_IFACE = "org.bluez.Device1"
-AGENT_MANAGER_IFACE = "org.bluez.AgentManager1"
+AGENT_MGR_IFACE = "org.bluez.AgentManager1"
+AGENT_IFACE = "org.bluez.Agent1"
+
 AGENT_PATH = "/bt/agent"
-AGENT_CAP = "NoInputNoOutput"
+AGENT_CAP = "NoInputNoOutput"  # “Just Works” pairing
 
 class Agent(ServiceInterface):
     def __init__(self):
-        super().__init__("org.bluez.Agent1")
+        super().__init__(AGENT_IFACE)
 
     @method()
-    def Release(self):
+    def Release(self):  # noqa: D401
         pass
 
     @method()
-    def RequestPinCode(self, device: 'o') -> 's':
-        # No keypad. Return empty or fixed code if needed.
+    def RequestPinCode(self, device: 'o') -> 's':  # noqa: N802
         return ""
 
     @method()
-    def DisplayPinCode(self, device: 'o', pincode: 's'):
+    def DisplayPinCode(self, device: 'o', pincode: 's'):  # noqa: N802
         pass
 
     @method()
-    def RequestPasskey(self, device: 'o') -> 'u':
+    def RequestPasskey(self, device: 'o') -> 'u':  # noqa: N802
         return 0
 
     @method()
-    def DisplayPasskey(self, device: 'o', passkey: 'u', entered: 'q'):
+    def DisplayPasskey(self, device: 'o', passkey: 'u', entered: 'q'):  # noqa: N802
         pass
 
     @method()
-    def RequestConfirmation(self, device: 'o', passkey: 'u'):
-        # Auto-accept matching codes
+    def RequestConfirmation(self, device: 'o', passkey: 'u'):  # noqa: N802
         return
 
     @method()
-    def RequestAuthorization(self, device: 'o'):
+    def RequestAuthorization(self, device: 'o'):  # noqa: N802
         return
 
     @method()
-    def AuthorizeService(self, device: 'o', uuid: 's'):
+    def AuthorizeService(self, device: 'o', uuid: 's'):  # noqa: N802
         return
 
     @method()
-    def Cancel(self):
+    def Cancel(self):  # noqa: D401
         pass
 
-async def get_managed_objects(bus):
-    obj = await bus.get_proxy_object(BLUEZ, "/", None)
-    mngr = obj.get_interface("org.freedesktop.DBus.ObjectManager")
-    return await mngr.call_get_managed_objects()
 
-async def main():
-    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+async def get_object_manager(bus: MessageBus):
+    # Properly introspect root for ObjectManager
+    intro = await bus.introspect(BLUEZ, "/")
+    obj = bus.get_proxy_object(BLUEZ, "/", intro)
+    return obj.get_interface(OBJMGR_IFACE)
 
-    # 1) Register Agent
+
+async def get_adapter_path(bus: MessageBus, retries: int = 10, delay: float = 0.5):
+    # Wait for BlueZ to export an adapter (hci0)
+    for _ in range(retries):
+        try:
+            mngr = await get_object_manager(bus)
+            objects = await mngr.call_get_managed_objects()
+            for path, ifaces in objects.items():
+                if ADAPTER_IFACE in ifaces:
+                    return path
+        except Exception:
+            pass
+        await asyncio.sleep(delay)
+    return None
+
+
+async def get_props_iface(bus: MessageBus, path: str):
+    intro = await bus.introspect(BLUEZ, path)
+    obj = bus.get_proxy_object(BLUEZ, path, intro)
+    return obj.get_interface(PROPS_IFACE)
+
+
+async def register_agent(bus: MessageBus):
+    # Introspect /org/bluez for AgentManager1
+    intro = await bus.introspect(BLUEZ, "/org/bluez")
+    obj = bus.get_proxy_object(BLUEZ, "/org/bluez", intro)
+    agent_mgr = obj.get_interface(AGENT_MGR_IFACE)
+
     agent = Agent()
     bus.export(AGENT_PATH, agent)
-    agent_mgr_obj = await bus.get_proxy_object(BLUEZ, "/org/bluez", [
-        "org.bluez.AgentManager1"
-    ])
-    agent_mgr = agent_mgr_obj.get_interface(AGENT_MANAGER_IFACE)
+
     try:
         await agent_mgr.call_register_agent(AGENT_PATH, AGENT_CAP)
     except Exception:
@@ -76,71 +104,84 @@ async def main():
         pass
     await agent_mgr.call_request_default_agent(AGENT_PATH)
 
-    # 2) Get adapter (hci0)
-    objects = await get_managed_objects(bus)
-    adapter_path = None
-    for path, ifaces in objects.items():
-        if ADAPTER_IFACE in ifaces:
-            adapter_path = path
-            break
+
+async def on_props_changed(bus: MessageBus, message: Message, adapter_props):
+    # Only care about Device1 Connected=true events
+    if message.message_type != Message.SIGNAL:
+        return
+    if message.interface != PROPS_IFACE or message.member != "PropertiesChanged":
+        return
+
+    iface, changed, _invalid = message.body
+    if iface != DEVICE_IFACE:
+        return
+
+    connected = changed.get("Connected")
+    if isinstance(connected, Variant) and connected.signature == "b" and connected.value:
+        dev_path = message.path
+        try:
+            dev_props = await get_props_iface(bus, dev_path)
+            await dev_props.call_set(DEVICE_IFACE, "Trusted", Variant("b", True))
+        except Exception as e:
+            print(f"[WARN] Failed to trust {dev_path}: {e}", flush=True)
+
+        # Keep adapter discoverable for the next phone
+        try:
+            await adapter_props.call_set(ADAPTER_IFACE, "Discoverable", Variant("b", True))
+        except Exception:
+            pass
+
+        print(f"[INFO] Device connected and trusted: {dev_path}", flush=True)
+
+
+async def main():
+    # Connect to the system bus
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+
+    # Register pairing agent first
+    await register_agent(bus)
+
+    # Get adapter path with a short retry window
+    adapter_path = await get_adapter_path(bus)
     if not adapter_path:
-        raise RuntimeError("Bluetooth adapter not found")
+        print("[ERROR] No Bluetooth adapter found. Is bluetooth.service running?", file=sys.stderr)
+        sys.exit(1)
 
-    adapter_obj = await bus.get_proxy_object(BLUEZ, adapter_path, [ADAPTER_IFACE, "org.freedesktop.DBus.Properties"])
-    adapter_props = adapter_obj.get_interface("org.freedesktop.DBus.Properties")
+    # Adapter properties interface
+    adapter_props = await get_props_iface(bus, adapter_path)
 
-    # Power on, discoverable, pairable, nice alias
-    await adapter_props.call_set(ADAPTER_IFACE, "Powered", Variant("b", True))
-    await adapter_props.call_set(ADAPTER_IFACE, "Discoverable", Variant("b", True))
-    await adapter_props.call_set(ADAPTER_IFACE, "Pairable", Variant("b", True))
-    await adapter_props.call_set(ADAPTER_IFACE, "Alias", Variant("s", "Pi Speaker"))
+    # Power on and make the adapter pairable and discoverable
+    for key, val in [
+        ("Powered", True),
+        ("Pairable", True),
+        ("Discoverable", True),
+        ("Alias", "Pi Speaker"),
+    ]:
+        try:
+            v = Variant("b", val) if isinstance(val, bool) else Variant("s", val)
+            await adapter_props.call_set(ADAPTER_IFACE, key, v)
+        except Exception as e:
+            print(f"[WARN] Failed setting {key}: {e}", flush=True)
 
-    # 3) Auto-trust and log connects
-    obj_manager = await bus.get_proxy_object(BLUEZ, "/", ["org.freedesktop.DBus.ObjectManager"])
-    props_changed_match = await bus.add_message_handler(
-        lambda msg: False  # placeholder to keep a reference; we use add_signal_receiver below
-    )
+    # Subscribe to PropertiesChanged across BlueZ namespace
+    async def handler(msg: Message):
+        await on_props_changed(bus, msg, adapter_props)
 
-    async def on_props_changed(message: Message):
-        if message.message_type != Message.SIGNAL:
-            return
-        if message.interface != "org.freedesktop.DBus.Properties":
-            return
-        if message.member != "PropertiesChanged":
-            return
-        iface, changed, invalidated = message.body
-        if iface != DEVICE_IFACE:
-            return
-        path = message.path
-        connected = changed.get("Connected")
-        if isinstance(connected, Variant) and connected.signature == "b" and connected.value:
-            # Device connected: trust it
-            dev_obj = await bus.get_proxy_object(BLUEZ, path, ["org.freedesktop.DBus.Properties"])
-            dev_props = dev_obj.get_interface("org.freedesktop.DBus.Properties")
-            try:
-                await dev_props.call_set(DEVICE_IFACE, "Trusted", Variant("b", True))
-            except Exception:
-                pass
-            # Keep discoverable for next devices too
-            try:
-                await adapter_props.call_set(ADAPTER_IFACE, "Discoverable", Variant("b", True))
-            except Exception:
-                pass
-            print(f"[INFO] Device connected and trusted: {path}")
-
-    # Subscribe to PropertiesChanged
     await bus.add_signal_receiver(
-        on_props_changed,
-        interface="org.freedesktop.DBus.Properties",
+        handler,
+        interface=PROPS_IFACE,
         signal="PropertiesChanged",
-        path_namespace="/org/bluez"
+        path_namespace="/org/bluez",
     )
 
-    print("[INFO] Pi is now a discoverable Bluetooth A2DP sink named 'Pi Speaker'.")
-    print("[INFO] On your phone: Bluetooth → pair with 'Pi Speaker' → set it as audio output.")
-    # Just sit forever
+    print("[INFO] Ready. Pair your phone with 'Pi Speaker' and select it as audio output.", flush=True)
+    # Sit forever
     await asyncio.get_running_loop().create_future()
 
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
 
